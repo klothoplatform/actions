@@ -1,0 +1,123 @@
+name: Klotho Deploy
+on:
+  workflow_dispatch:
+    inputs:
+      repository:
+        description: The repository to build and deploy, in "Organization/Repo" format
+        type: string
+        required: true
+      ref:
+        description: The Git ref within the repository (branch name, tag, or SHA)
+        type: string
+        required: true
+      region:
+        description: The AWS region to deploy to (e.g. "us-east-1")
+        type: string
+        required: true
+      klotho-login:
+        description: The email address to log into Klotho with
+        type: string
+        required: true
+      config-file:
+        description: Path to the Klotho config file, relative to the caller repo.
+        type: string
+        required: false
+        default: klotho.yaml
+      hook-secrets:
+        description: 'A JSON object of secret key-values to use in the *-script scripts'
+        type: string
+        required: false
+        default: ''
+      pre-deploy-hook:
+        description: Script to run before deploying
+        type: string
+        required: false
+        default: ''
+    secrets:
+      aws-access-key-id:
+        required: true
+      aws-secret-acess-key:
+        required: true
+      pulumi-access-token:
+        required: true
+env:
+  # Set this to your preferred AWS region, like us-east-1
+  AWS_REGION: <region>
+  # Set your application name. Changing this will orphan the previous 
+  # deployment and proceed with a new one.
+  # Change with caution, if you have already deployed.
+  APP_NAME: <app name>
+  # Set this to the email you used to register with Klotho
+  KLOTHO_EMAIL: <email>
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+    - name: Set up hook script secrets
+      run: |
+        # Note: it's vital to use "jq <<< $HOOK_SECRETS" and not "echo $HOOK_SECRETS | jq", so that bash won't ever
+        # echo them to stderr (e.g. if you add "set -x" by mistake)
+        function jq_hooks() { jq <<< "$HOOK_SECRETS" "$@" ; }
+        function secrets_err() { echo "::error title=invalid hook-secrets::$*" ; exit 1 ; }
+
+        if ! jq_hooks -r '"hook secrets have valid json"' ; then
+          secrets_err "Hook secrets must be a JSON object"
+        fi
+        invalid_keys="$(jq_hooks 'keys[] | select(test("^\\w+$") | not) | "invalid"')"
+        if [[ -n "$(jq_hooks 'keys[] | select(test("^\\w+$") | not) | "invalid"')" ]] ; then
+          secrets_err "Hook secret keys may only contain alphanumerics and underscores"
+        fi
+        if [[ -n "$(jq_hooks 'to_entries[].value | type | select(test("number|boolean|string") | not) | "error"')" ]]; then
+          secrets_err "Hook secret values must be non-null scalars"
+        fi
+        if [[ -n "$(jq_hooks 'to_entries[].value | select(tostring | test("\n")) | "error"')" ]]; then
+          secrets_err "Hook secret values may not contain newlines"
+        fi
+        # okay, everything is sanitized. Now just add the masks and env vars
+        jq_hooks -r 'to_entries[] | "::add-mask::\(.value)"'
+        jq_hooks -r 'to_entries[] | "SECRET_\(.key)=\(.value)"' >> $GITHUB_ENV
+      env:
+        HOOK_SECRETS: ${{ inputs.hook-secrets }}
+      if: inputs.hook-secrets
+    - uses: actions/checkout@v2
+    - name: Use Node.js 16.x
+      uses: actions/setup-node@v2
+      with:
+        node-version: 16.x
+        cache: "npm"
+        cache-dependency-path: package-lock.json
+    - name: Build
+      run: |
+        npm ci
+        npx tsc
+    - name: Install Klotho 
+      run: |
+        curl -fsSL http://srv.klo.dev/update/latest/linux/amd64 -o "$RUNNER_TEMP/klotho"
+        chmod +x "$RUNNER_TEMP/klotho"
+        "$RUNNER_TEMP/klotho" --login "$KLOTHO_EMAIL"
+    - name: Klotho compile
+      run: |
+        "$RUNNER_TEMP/klotho" . --app "$APP_NAME" --provider aws
+    - name: Install compiled dependencies
+      run: npm install
+      working-directory: ./compiled
+    - name: Pre-deploy hook
+      if: inputs.pre-deploy-hook
+      run: ${{ inputs.pre-deploy-hook }}
+    - name: Pulumi deploy
+      run: |
+        pulumi -C compiled -s "$APP_NAME" stack select --create
+        pulumi -C compiled -s "$APP_NAME" config set aws:region "${AWS_REGION}" 
+        pulumi -C compiled -s "$APP_NAME" refresh --yes
+        pulumi -C compiled -s "$APP_NAME" up --yes
+
+        pulumi_out="$(pulumi -C compiled -s "$APP_NAME" stack output --json)"
+        for key in $(echo "$pulumi_out" | jq -r '. | keys[]') ; do
+          echo "$pulumi_out" | jq -r '.[$key]' --arg key "$key" | sed "s/^/::notice title=$key::/"
+        done
+      env:
+        AWS_ACCESS_KEY_ID: ${{ secrets.AWS_ACCESS_KEY_ID }}
+        AWS_SECRET_ACCESS_KEY: ${{ secrets.AWS_SECRET_ACCESS_KEY }}
+        PULUMI_ACCESS_TOKEN: ${{ secrets.PULUMI_ACCESS_TOKEN }}
+        PULUMI_CONFIG_PASSPHRASE: ""
